@@ -1,24 +1,25 @@
 const std = @import("std");
 
-const OUTPUT_FILE = "output.txt";
+const OUTPUT_DIR = "repoprint-out";
 const IGNORE_FILE = ".repoprintignore";
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const DEBUG = false;
 
 fn debug(comptime fmt: []const u8, args: anytype) void {
-    if (DEBUG) {
-        std.debug.print("[DEBUG] " ++ fmt ++ "\n", args);
-    }
+    if (DEBUG) std.debug.print("[DEBUG] " ++ fmt ++ "\n", args);
 }
 
 const RuleType = enum { ignore, content };
-const PatternType = enum { exact, starts_with, ends_with };
+const PatternType = enum { exact, starts_with, ends_with, contains };
 
 const Rule = struct {
     pattern: []const u8,
     pattern_type: PatternType,
     rule_type: RuleType,
 
+    pub fn _init(pattern: []const u8, pattern_type: PatternType, rule_type: RuleType) Rule {
+        return .{ .pattern = pattern, .pattern_type = pattern_type, .rule_type = rule_type };
+    }
     pub fn init(raw: []const u8) Rule {
         var rule_type: RuleType = .ignore;
         var pattern = raw;
@@ -26,14 +27,15 @@ const Rule = struct {
             rule_type = .content;
             pattern = pattern["@content ".len..];
         }
-        const trimmed = std.mem.trimStart(u8, pattern, "/");
-        if (std.mem.startsWith(u8, trimmed, "*")) {
-            return .{ .pattern = trimmed[1..], .pattern_type = .ends_with, .rule_type = rule_type };
-        }
-        if (std.mem.endsWith(u8, trimmed, "*")) {
-            return .{ .pattern = trimmed[0 .. trimmed.len - 1], .pattern_type = .starts_with, .rule_type = rule_type };
-        }
-        return .{ .pattern = trimmed, .pattern_type = .exact, .rule_type = rule_type };
+        const clean = std.mem.trim(u8, pattern, "/");
+        const pre_star = std.mem.startsWith(u8, clean, "*");
+        const post_star = std.mem.endsWith(u8, clean, "*");
+        // zig fmt: off
+        if (pre_star and post_star and clean.len >= 2) return ._init(clean[1 .. clean.len - 1], .contains, rule_type);
+        if (pre_star)                                  return ._init(clean[1..],                .ends_with, rule_type);
+        if (post_star)                                 return ._init(clean[0 .. clean.len - 1], .starts_with, rule_type);
+        return ._init(clean, .exact, rule_type);
+        // zig fmt: on
     }
 
     pub fn matches(self: Rule, rel_path: []const u8) bool {
@@ -42,17 +44,23 @@ const Rule = struct {
             .exact => std.mem.eql(u8, path, self.pattern),
             .starts_with => std.mem.startsWith(u8, path, self.pattern),
             .ends_with => std.mem.endsWith(u8, path, self.pattern),
+            .contains => std.mem.indexOf(u8, path, self.pattern) != null,
         };
     }
 };
 
 fn isPathIgnored(rel_path: []const u8, rules: []const Rule) bool {
-    if (std.mem.eql(u8, rel_path, OUTPUT_FILE)) return true;
+    if (std.mem.eql(u8, rel_path, OUTPUT_DIR) or std.mem.startsWith(u8, rel_path, OUTPUT_DIR ++ "/"))
+        return true;
     for (rules) |rule| {
         if (rule.rule_type != .ignore) continue;
         if (rule.matches(rel_path)) return true;
     }
     return false;
+}
+fn getOutputFilename(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+    const timestamp = std.Io.Clock.now(.real, io);
+    return std.fmt.allocPrint(allocator, "out-{d}.txt", .{timestamp.toNanoseconds()});
 }
 fn isContentIgnored(rel_path: []const u8, rules: []const Rule) bool {
     for (rules) |rule| {
@@ -172,9 +180,21 @@ pub fn main(init: std.process.Init) !void {
 
     // ========================================================================================================================
     // 5. Utworzenie pliku wynikowego
-    var out_file = try dir.createFile(io, OUTPUT_FILE, .{ .truncate = true });
+    dir.createDir(io, OUTPUT_DIR, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    var output_dir = try dir.openDir(io, OUTPUT_DIR, .{});
+    defer output_dir.close(io);
+
+    const output_filename = try getOutputFilename(init.io, allocator);
+    defer allocator.free(output_filename);
+
+    var out_file = try output_dir.createFile(io, output_filename, .{ .truncate = true });
     defer out_file.close(io);
-    debug("OUTPUT_FILE was created", .{});
+
+    debug("Output file created: {s}/{s}", .{ OUTPUT_DIR, output_filename });
     // ========================================================================================================================
 
     // ========================================================================================================================
